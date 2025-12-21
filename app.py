@@ -15,6 +15,7 @@ import os
 import streamlit as st
 from openai import OpenAI
 
+import ingest
 import prompts
 import retriever
 
@@ -25,6 +26,24 @@ KB_DOCS_DIR = os.getenv("KB_DOCS_DIR", "docs")
 CHROMA_PATH = os.getenv("KB_CHROMA_PATH", "data/chroma")
 COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "kb_docs")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+# Назначение: переиндексировать базу знаний при старте процесса Streamlit (то есть при перезапуске сервиса).
+# Зачем: чтобы на деплое индекс создавался автоматически, без ручного запуска `python ingest.py`.
+# Связано с: `ingest.run_ingest()` (строит индекс) и `retriever.retrieve()` (потом читает индекс).
+@st.cache_resource
+def _auto_ingest_on_start():
+    return ingest.run_ingest(
+        doc_dir=KB_DOCS_DIR,
+        chroma_path=CHROMA_PATH,
+        collection_name=COLLECTION_NAME,
+    )
+
+
+# Автоиндексация при старте (один раз на процесс).
+# Важно: Streamlit перезапускает скрипт на каждое действие пользователя, поэтому используем cache_resource.
+if os.getenv("OPENAI_API_KEY"):
+    _auto_ingest_on_start()
 
 
 # Назначение: в Streamlit код перезапускается на каждое действие пользователя, поэтому клиент OpenAI кэшируем и переиспользуем,

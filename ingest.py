@@ -9,26 +9,6 @@ ingest.py — индексация базы знаний в Chroma (вектор
 - `app.py` — не индексирует сам, а только читает индекс через retriever.
 """
 
-# --- SQLite shim (нужен в некоторых контейнерах/облачных окружениях) ---
-# Важно: должен выполниться ДО импорта chromadb.
-try:
-    import sqlite3
-    from sqlite3 import sqlite_version
-
-    def _version_tuple(version_str):
-        return tuple(int(part) for part in version_str.split("."))
-
-    NEEDS_SHIM = _version_tuple(sqlite_version) < (3, 35, 0)
-except Exception:
-    NEEDS_SHIM = True
-
-if NEEDS_SHIM:
-    import sys
-    import pysqlite3  # noqa: F401
-
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-# ---------------------------------------------------------------
-
 import glob
 import os
 
