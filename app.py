@@ -392,6 +392,10 @@ def _run_sql_with_autofix(question):
         f"schema_text:\n{schema_text}\n\n"
         f"sql_text:\n{sql_text}\n"
     ).strip()
+    #убрать после дебагинга
+    with st.chat_message("assistant"):
+        st.caption("DEBUG: сгенерированный SQL (до выполнения)")
+        st.code(sql_text or "", language="sql")
     if not sql_text:
         #убрать после дебагинга
         st.session_state["_debug_sql_payload"] = (
