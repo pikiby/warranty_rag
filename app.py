@@ -26,7 +26,7 @@ APP_TITLE = "Minimal RAG Chat"
 KB_DOCS_DIR = os.getenv("KB_DOCS_DIR", "docs")
 CHROMA_PATH = os.getenv("KB_CHROMA_PATH", "data/chroma")
 COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "kb_docs")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB", "db1")
 
 #-------------------------
