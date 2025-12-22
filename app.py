@@ -29,6 +29,25 @@ COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "kb_docs")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB", "db1")
 
+#-------------------------
+# Назначение: минимально нормализовать пользовательский текст перед тем, как его увидит GPT и ретривер.
+# Зачем: исправляем частые опечатки и "склейки" слов, которые ломают маршрутизацию и RAG-поиск.
+# Связано с: `_get_chat_history_for_gpt()` (нормализует user-реплики), `_answer_with_rag()` (поиск),
+#           `_run_sql_with_autofix()` (генерация SQL) и `_select_mode()` (авто-выбор режима).
+def _normalize_user_text(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    normalized = text
+    normalized = normalized.replace("погороду", "по городу")
+    normalized = normalized.replace("подате", "по дате")
+    normalized = normalized.replace("видешь", "видишь")
+    normalized = normalized.replace("видет", "видит")
+
+    normalized = " ".join(normalized.split())
+    return normalized
+
 
 # Назначение: переиндексировать базу знаний при старте процесса Streamlit (то есть при перезапуске сервиса).
 # Зачем: чтобы на деплое индекс создавался автоматически, без ручного запуска `python ingest.py`.
@@ -98,6 +117,8 @@ def _get_chat_history_for_gpt():
         # Первое приветствие ассистента нужно для UI, но не обязательно для логики диалога у GPT.
         if role == "assistant" and content.startswith("Задайте вопрос."):
             continue
+        if role == "user":
+            content = _normalize_user_text(content)
         history.append({"role": role, "content": content})
     return history
 
@@ -214,21 +235,66 @@ def _fix_sql(question, schema_text, history, sql_history_text, sql_text, error_t
 
 
 #-------------------------
+# Назначение: проверить, что SQL безопасен и соответствует правилам проекта.
+# Зачем: даже при хорошем промпте модель иногда может вернуть `system.*` или DDL/изменения — это нужно жёстко запретить.
+# Связано с: `_run_sql_with_autofix()` — проверяет SQL перед выполнением (и до, и после автопочинки).
+def _validate_sql_safety(sql_text):
+    sql_clean = (sql_text or "").strip()
+    if not sql_clean:
+        return "Пустой SQL."
+
+    sql_lower = sql_clean.lower()
+    sql_lower_no_space = " ".join(sql_lower.split())
+
+    if "system." in sql_lower_no_space or " system." in sql_lower_no_space:
+        return "Запрещены запросы к system.*"
+
+    allowed_start = sql_lower_no_space.startswith("select ") or sql_lower_no_space.startswith("with ")
+    if not allowed_start:
+        return "Разрешены только SELECT / WITH ... SELECT."
+
+    forbidden = [
+        "create ",
+        "alter ",
+        "drop ",
+        "truncate ",
+        "rename ",
+        "attach ",
+        "detach ",
+        "insert ",
+        "update ",
+        "delete ",
+        "optimize ",
+        "grant ",
+        "revoke ",
+    ]
+    for token in forbidden:
+        if token in sql_lower_no_space:
+            return "Запрещены DDL и любые изменения данных."
+
+    return ""
+
+
+#-------------------------
 # Назначение: выполнить SQL с одной встроенной автопочинкой при ошибке.
 # Зачем: пользователь получает результат без ручных правок, а схема всегда подгружается автоматически.
 # Связано с: `_generate_sql()` (первый SQL), `_fix_sql()` (починка) и `ClickHouse_client.query_run()` (выполнение).
 def _run_sql_with_autofix(question):
     history = _get_chat_history_for_gpt()
-    if history and history[-1].get("role") == "user" and (history[-1].get("content") or "").strip() == question.strip():
+    if history and history[-1].get("role") == "user":
         history = history[:-1]
     sql_history_text = _get_sql_history_text()
     schema_text = _get_schema_text()
 
+    question = _normalize_user_text(question)
     sql_text = _generate_sql(question, schema_text, history, sql_history_text)
     if not sql_text:
         raise RuntimeError("GPT не вернул SQL.")
 
     clickhouse_client = _get_clickhouse_client()
+    safety_error = _validate_sql_safety(sql_text)
+    if safety_error:
+        raise RuntimeError(f"SQL заблокирован: {safety_error}")
     try:
         df = clickhouse_client.query_run(sql_text)
         return df, sql_text
@@ -243,6 +309,9 @@ def _run_sql_with_autofix(question):
         )
         if not fixed_sql:
             raise
+        safety_error = _validate_sql_safety(fixed_sql)
+        if safety_error:
+            raise RuntimeError(f"SQL заблокирован: {safety_error}")
         df = clickhouse_client.query_run(fixed_sql)
         return df, fixed_sql
 
@@ -252,13 +321,35 @@ def _run_sql_with_autofix(question):
 # потом кладём найденный текст в prompt и только после этого спрашиваем GPT.
 # Связано с: `retriever.retrieve()` (ищет top-k чанков в базе знаний) и `prompts.RAG_SYSTEM_PROMPT` (правила ответа).
 def _answer_with_rag(question):
-    hits = retriever.retrieve(
-        query=question,
-        k=5,
-        chroma_path=CHROMA_PATH,
-        collection_name=COLLECTION_NAME,
-    )
-    context_text = _build_context_text(hits)
+    question = _normalize_user_text(question)
+
+    retrieve_queries = [question]
+    question_lower = question.lower()
+    if "таблиц" in question_lower or "таблица" in question_lower or "справоч" in question_lower:
+        retrieve_queries.append("каталог таблиц")
+        retrieve_queries.append("справочники")
+
+    hits = []
+    for query_text in retrieve_queries:
+        hits.extend(
+            retriever.retrieve(
+                query=query_text,
+                k=5,
+                chroma_path=CHROMA_PATH,
+                collection_name=COLLECTION_NAME,
+            )
+        )
+
+    seen = set()
+    unique_hits = []
+    for hit in hits:
+        text = (hit.get("text") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique_hits.append(hit)
+
+    context_text = _build_context_text(unique_hits)
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
     sql_history_text = _get_sql_history_text()
