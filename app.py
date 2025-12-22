@@ -97,9 +97,6 @@ def _answer_with_rag(question):
         collection_name=COLLECTION_NAME,
     )
     context_text = _build_context_text(hits)
-    if not context_text:
-        return "В индексе базы знаний нет данных по запросу (или индекс не создан)."
-
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
     # В историю уже попал текущий вопрос (мы добавляем его в UI-историю до вызова `_answer_with_rag()`).
@@ -156,6 +153,5 @@ if question:
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
-
 
 
