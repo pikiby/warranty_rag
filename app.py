@@ -189,6 +189,30 @@ def _extract_sql_text(model_text):
 
 
 #-------------------------
+# Назначение: переформулировать вопрос в короткий поисковый запрос для базы знаний (RAG).
+# Зачем: векторный поиск иногда промахивается по общим формулировкам; перефраз помогает попасть в нужный документ.
+# Связано с: `_answer_with_rag()` — если первый retrieval пустой, делаем rewrite и повторяем поиск.
+def _rewrite_query_for_kb(question):
+    question = _normalize_user_text(question)
+    if not question:
+        return ""
+
+    client = _get_openai_client()
+    messages = [
+        {"role": "system", "content": prompts.KB_QUERY_REWRITE_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    response = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0)
+    rewritten = (response.choices[0].message.content or "").strip()
+    rewritten = _normalize_user_text(rewritten)
+    if not rewritten:
+        return ""
+    if rewritten == question:
+        return ""
+    return rewritten
+
+
+#-------------------------
 # Назначение: сгенерировать SQL по вопросу пользователя (режим SQL).
 # Зачем: пользователь пишет обычный вопрос, а мы получаем SQL для выполнения в ClickHouse.
 # Связано с: `prompts.SQL_SYSTEM_PROMPT` (правила для SQL) и `_run_sql_with_autofix()` (выполнение и автопочинка).
@@ -364,6 +388,15 @@ def _answer_with_rag(question):
         chroma_path=CHROMA_PATH,
         collection_name=COLLECTION_NAME,
     )
+    if not hits:
+        rewritten_query = _rewrite_query_for_kb(question)
+        if rewritten_query:
+            hits = retriever.retrieve(
+                query=rewritten_query,
+                k=5,
+                chroma_path=CHROMA_PATH,
+                collection_name=COLLECTION_NAME,
+            )
     context_text = _build_context_text(hits)
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
