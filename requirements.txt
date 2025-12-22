@@ -1,4 +1,6 @@
 streamlit>=1.36
 openai>=1.40
 chromadb>=0.5.0
-
+pandas>=2.0
+clickhouse-connect>=0.7
+python-dotenv>=1.0
