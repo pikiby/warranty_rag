@@ -44,9 +44,31 @@ class ClickHouse_client:
             result = self.client.query(query_text)
         except Exception as error:
             error_text = str(error)
-            dup = f"{CLICKHOUSE_DB}.{CLICKHOUSE_DB}."
-            if ("Code: 60" in error_text or "UNKNOWN_TABLE" in error_text) and dup in query_text:
-                fixed_query = query_text.replace(dup, f"{CLICKHOUSE_DB}.")
+            is_unknown_table = ("Code: 60" in error_text) or ("UNKNOWN_TABLE" in error_text)
+            if not is_unknown_table:
+                raise
+
+            #-------------------------
+            # Назначение: локально исправить частую ошибку модели: двойной префикс БД (`db.db.table`).
+            # Зачем: ClickHouse явно подсказывает "Maybe you meant db.table", поэтому не гоняем лишний запрос к GPT.
+            # Связано с: `app.py::_run_sql_with_autofix()` — если починка тут сработала, пользователь сразу получает результат.
+            db = (CLICKHOUSE_DB or "").strip()
+            if not db:
+                raise
+
+            replacements = {
+                f"{db}.{db}.": f"{db}.",
+                f"`{db}`.`{db}`.": f"`{db}`.",
+                f"`{db}`.{db}.": f"`{db}`.",
+                f"{db}.`{db}`.": f"{db}.",
+            }
+
+            fixed_query = query_text
+            for needle, repl in replacements.items():
+                if needle in fixed_query:
+                    fixed_query = fixed_query.replace(needle, repl)
+
+            if fixed_query != query_text:
                 result = self.client.query(fixed_query)
             else:
                 raise
