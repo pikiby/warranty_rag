@@ -86,7 +86,7 @@ def _build_context_text(hits):
             parts.append(chunk_text)
     return "\n\n".join(parts).strip()
 
-#-------------------------
+
 # Назначение: собрать историю SQL-запросов в одном тексте для передачи в GPT.
 # Зачем: пользователь может уточнять и продолжать работу, а модель должна видеть, что уже выполнялось.
 # Связано с: `st.session_state.sql_history` (хранилище) и `_answer_with_rag()`/`_generate_sql()`/`_fix_sql()` (куда этот текст подставляется).
@@ -154,11 +154,8 @@ def _get_schema_text():
 def _select_mode():
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
-    sql_history_text = _get_sql_history_text()
 
     messages = [{"role": "system", "content": prompts.ROUTER_PROMPT}]
-    if sql_history_text:
-        messages.append({"role": "system", "content": sql_history_text})
     messages.extend(history)
 
     response = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0)
@@ -316,6 +313,44 @@ def _run_sql_with_autofix(question):
         return df, fixed_sql
 
 
+#-------------------------
+# Назначение: обработать вопрос в режиме RAG и вывести ответ в чат.
+# Пайплайн: вопрос -> retrieval (Chroma) -> контекст -> запрос к GPT -> ответ.
+# Связано с: `_answer_with_rag()` (логика RAG) и `st.session_state.messages` (история чата для UI/контекста).
+def _handle_rag_message(question):
+    answer = _answer_with_rag(question)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    with st.chat_message("assistant"):
+        st.markdown(answer)
+
+
+#-------------------------
+# Назначение: обработать вопрос в режиме SQL и вывести результат в чат.
+# Пайплайн: вопрос -> схема -> GPT генерирует SQL -> ClickHouse выполняет -> (если ошибка) GPT чинит -> повтор -> таблица.
+# Связано с: `_run_sql_with_autofix()` (выполнение + автопочинка), `st.session_state.sql_history` (память SQL),
+#           и рендером вкладок "Ответ/SQL" в UI.
+def _handle_sql_message(question):
+    try:
+        df, used_sql = _run_sql_with_autofix(question)
+    except Exception as error:
+        error_text = f"Ошибка SQL: {error}"
+        st.session_state.messages.append({"role": "assistant", "content": error_text})
+        with st.chat_message("assistant"):
+            st.markdown(error_text)
+        return
+
+    st.session_state.sql_history.append(used_sql)
+    answer_text = "Готово. Выполнил SQL и показал результат."
+    st.session_state.messages.append({"role": "assistant", "content": answer_text, "sql_query": used_sql, "df": df})
+    with st.chat_message("assistant"):
+        tabs = st.tabs(["Ответ", "SQL"])
+        with tabs[0]:
+            st.markdown(answer_text)
+            st.dataframe(df, use_container_width=True)
+        with tabs[1]:
+            st.code(used_sql, language="sql")
+
+
 # Назначение: выполнить самый простой RAG-пайплайн: найти контекст и ответить строго по нему.
 # Зачем: GPT отвечает только по тексту, который мы ему передали. Поэтому сначала делаем retrieval (поиск чанков в коллекции Chroma),
 # потом кладём найденный текст в prompt и только после этого спрашиваем GPT.
@@ -323,39 +358,16 @@ def _run_sql_with_autofix(question):
 def _answer_with_rag(question):
     question = _normalize_user_text(question)
 
-    retrieve_queries = [question]
-    question_lower = question.lower()
-    if "таблиц" in question_lower or "таблица" in question_lower or "справоч" in question_lower:
-        retrieve_queries.append("каталог таблиц")
-        retrieve_queries.append("справочники")
-
-    hits = []
-    for query_text in retrieve_queries:
-        hits.extend(
-            retriever.retrieve(
-                query=query_text,
-                k=5,
-                chroma_path=CHROMA_PATH,
-                collection_name=COLLECTION_NAME,
-            )
-        )
-
-    seen = set()
-    unique_hits = []
-    for hit in hits:
-        text = (hit.get("text") or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        unique_hits.append(hit)
-
-    context_text = _build_context_text(unique_hits)
+    hits = retriever.retrieve(
+        query=question,
+        k=5,
+        chroma_path=CHROMA_PATH,
+        collection_name=COLLECTION_NAME,
+    )
+    context_text = _build_context_text(hits)
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
-    sql_history_text = _get_sql_history_text()
     messages = [{"role": "system", "content": prompts.RAG_SYSTEM_PROMPT}]
-    if sql_history_text:
-        messages.append({"role": "system", "content": sql_history_text})
     messages.append({"role": "system", "content": f"КОНТЕКСТ БАЗЫ ЗНАНИЙ:\n{context_text}".strip()})
     messages.extend(history)
     resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages)
@@ -411,6 +423,19 @@ for message in st.session_state.messages:
         else:
             st.markdown(message["content"])
 
+#-------------------------
+# ОБРАБОТКА НОВОГО СООБЩЕНИЯ (пайплайн)
+# 1) Получить ввод пользователя из `st.chat_input`.
+# 2) Сохранить сообщение в `st.session_state.messages` (память для UI и контекста).
+# 3) Показать сообщение пользователя в UI сразу.
+# 4) Автоматически выбрать режим через GPT-роутер `_select_mode()`.
+# 5) Выполнить выбранный пайплайн:
+#    - RAG: `_handle_rag_message()` (retrieval -> контекст -> GPT -> ответ)
+#    - SQL: `_handle_sql_message()` (схема -> GPT SQL -> ClickHouse -> автопочинка -> таблица)
+#
+# Важно: мы не строим “триггеры” режима в коде — выбор делает только модель (как в `ai_bi`).
+#-------------------------
+
 # Поле ввода пользователя (чат).
 question = st.chat_input("Ваш вопрос")
 if question:
@@ -424,29 +449,6 @@ if question:
     # 3) Автоматически выбираем режим и получаем ответ.
     mode = _select_mode()
     if mode == "RAG":
-        answer = _answer_with_rag(question)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer)
+        _handle_rag_message(question)
     else:
-        # Режим SQL: генерируем SQL, выполняем, показываем таблицу и сохраняем SQL отдельно.
-        try:
-            df, used_sql = _run_sql_with_autofix(question)
-        except Exception as error:
-            error_text = f"Ошибка SQL: {error}"
-            st.session_state.messages.append({"role": "assistant", "content": error_text})
-            with st.chat_message("assistant"):
-                st.markdown(error_text)
-        else:
-            st.session_state.sql_history.append(used_sql)
-            answer_text = "Готово. Выполнил SQL и показал результат."
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer_text, "sql_query": used_sql, "df": df}
-            )
-            with st.chat_message("assistant"):
-                tabs = st.tabs(["Ответ", "SQL"])
-                with tabs[0]:
-                    st.markdown(answer_text)
-                    st.dataframe(df, use_container_width=True)
-                with tabs[1]:
-                    st.code(used_sql, language="sql")
+        _handle_sql_message(question)
