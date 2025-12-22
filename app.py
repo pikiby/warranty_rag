@@ -21,7 +21,7 @@ import retriever
 from clickhouse_client import ClickHouse_client
 
 
-APP_TITLE = "Minimal RAG Chat"
+APP_TITLE = "RAG + SQL Chat"
 
 KB_DOCS_DIR = os.getenv("KB_DOCS_DIR", "docs")
 CHROMA_PATH = os.getenv("KB_CHROMA_PATH", "data/chroma")
@@ -493,7 +493,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Задайте вопрос. Я отвечу строго по базе знаний (RAG).",
+            "content": "Спроси по базе знаний. Примеры: «какие таблицы есть?», «выполни SQL: …».",
         }
     ]
 
