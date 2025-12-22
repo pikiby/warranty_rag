@@ -65,6 +65,49 @@ def _extract_table_names_from_kb(context_text):
     return sorted(set(names))
 
 
+#-------------------------
+# Назначение: достать из текста ошибки ClickHouse список "Missing columns".
+# Зачем: если модель забыла обернуть имя колонки в обратные кавычки, ClickHouse вернёт UNKNOWN_IDENTIFIER
+# и список отсутствующих колонок — их можно починить локально.
+# Связано с: `_run_sql_with_autofix()` — пробует локально исправить SQL и повторить запрос.
+def _extract_missing_columns(error_text):
+    import re
+
+    text = (error_text or "").strip()
+    if not text:
+        return []
+
+    match = re.search(r"Missing columns:\s*(.*?)\s*while processing:", text, flags=re.DOTALL)
+    if not match:
+        return []
+
+    missing_part = match.group(1)
+    cols = re.findall(r"'([^']+)'", missing_part)
+    return [c.strip() for c in cols if (c or "").strip()]
+
+
+#-------------------------
+# Назначение: обернуть отсутствующие колонки в обратные кавычки в SQL.
+# Зачем: для ClickHouse имена колонок на русском/с пробелами/двоеточиями должны быть в `` `...` ``.
+# Связано с: `_extract_missing_columns()` и `_run_sql_with_autofix()` (локальная починка без запроса к GPT).
+def _backtick_missing_columns(sql_text, missing_columns):
+    import re
+
+    text = (sql_text or "").strip()
+    if not text:
+        return ""
+
+    fixed = text
+    for col in (missing_columns or []):
+        col = (col or "").strip()
+        if not col:
+            continue
+        pattern = r"(?<!`)" + re.escape(col) + r"(?!`)"
+        fixed = re.sub(pattern, f"`{col}`", fixed)
+
+    return fixed
+
+
 # Назначение: переиндексировать базу знаний при старте процесса Streamlit (то есть при перезапуске сервиса).
 # Зачем: чтобы на деплое индекс создавался автоматически, без ручного запуска `python ingest.py`.
 # Связано с: `ingest.run_ingest()` (строит индекс) и `retriever.retrieve()` (потом читает индекс).
@@ -328,23 +371,75 @@ def _run_sql_with_autofix(question):
     kb_context_text = _build_context_text(kb_hits)
     table_names = _extract_table_names_from_kb(kb_context_text)
     if not table_names:
+        #убрать после дебагинга
+        st.session_state["_debug_sql_payload"] = (
+            "DEBUG BEFORE ERROR\n\n"
+            f"question:\n{question}\n\n"
+            f"kb_context_text:\n{kb_context_text}\n"
+        ).strip()
         raise RuntimeError("Не могу определить таблицу из базы знаний. Уточните, к какой таблице нужен запрос.")
 
     table_name = table_names[0]
     schema_text = _get_schema_text(table_name)
 
     sql_text = _generate_sql(question, schema_text, history, sql_history_text)
+    #убрать после дебагинга
+    st.session_state["_debug_sql_payload"] = (
+        "DEBUG BEFORE EXECUTE\n\n"
+        f"question:\n{question}\n\n"
+        f"table_name:\n{table_name}\n\n"
+        f"kb_context_text:\n{kb_context_text}\n\n"
+        f"schema_text:\n{schema_text}\n\n"
+        f"sql_text:\n{sql_text}\n"
+    ).strip()
     if not sql_text:
+        #убрать после дебагинга
+        st.session_state["_debug_sql_payload"] = (
+            "DEBUG BEFORE ERROR\n\n"
+            f"question:\n{question}\n\n"
+            f"table_name:\n{table_name}\n\n"
+            f"kb_context_text:\n{kb_context_text}\n\n"
+            f"schema_text:\n{schema_text}\n"
+        ).strip()
         raise RuntimeError("GPT не вернул SQL.")
 
     clickhouse_client = _get_clickhouse_client()
     safety_error = _validate_sql_safety(sql_text)
     if safety_error:
+        #убрать после дебагинга
+        st.session_state["_debug_sql_payload"] = (
+            "DEBUG BEFORE ERROR\n\n"
+            f"question:\n{question}\n\n"
+            f"table_name:\n{table_name}\n\n"
+            f"kb_context_text:\n{kb_context_text}\n\n"
+            f"schema_text:\n{schema_text}\n\n"
+            f"sql_text:\n{sql_text}\n\n"
+            f"safety_error:\n{safety_error}\n"
+        ).strip()
         raise RuntimeError(f"SQL заблокирован: {safety_error}")
     try:
         df = clickhouse_client.query_run(sql_text)
         return df, sql_text
     except Exception as error:
+        missing_cols = _extract_missing_columns(str(error))
+        if missing_cols:
+            fixed_sql_local = _backtick_missing_columns(sql_text, missing_cols)
+            if fixed_sql_local and fixed_sql_local != sql_text:
+                #убрать после дебагинга
+                st.session_state["_debug_sql_payload"] = (
+                    "DEBUG LOCAL FIX\n\n"
+                    f"question:\n{question}\n\n"
+                    f"table_name:\n{table_name}\n\n"
+                    f"missing_cols:\n{missing_cols}\n\n"
+                    f"sql_text:\n{sql_text}\n\n"
+                    f"fixed_sql_local:\n{fixed_sql_local}\n"
+                ).strip()
+                try:
+                    df = clickhouse_client.query_run(fixed_sql_local)
+                    return df, fixed_sql_local
+                except Exception:
+                    pass
+
         fixed_sql = _fix_sql(
             question=question,
             schema_text=schema_text,
@@ -357,6 +452,17 @@ def _run_sql_with_autofix(question):
             raise
         safety_error = _validate_sql_safety(fixed_sql)
         if safety_error:
+            #убрать после дебагинга
+            st.session_state["_debug_sql_payload"] = (
+                "DEBUG BEFORE ERROR\n\n"
+                f"question:\n{question}\n\n"
+                f"table_name:\n{table_name}\n\n"
+                f"kb_context_text:\n{kb_context_text}\n\n"
+                f"schema_text:\n{schema_text}\n\n"
+                f"sql_text:\n{sql_text}\n\n"
+                f"fixed_sql:\n{fixed_sql}\n\n"
+                f"safety_error:\n{safety_error}\n"
+            ).strip()
             raise RuntimeError(f"SQL заблокирован: {safety_error}")
         df = clickhouse_client.query_run(fixed_sql)
         return df, fixed_sql
@@ -383,6 +489,11 @@ def _handle_sql_message(question):
         df, used_sql = _run_sql_with_autofix(question)
     except Exception as error:
         error_text = f"Ошибка SQL: {error}"
+        #убрать после дебагинга
+        debug_payload = (st.session_state.get("_debug_sql_payload") or "").strip()
+        if debug_payload:
+            with st.chat_message("assistant"):
+                st.code(debug_payload)
         st.session_state.messages.append({"role": "assistant", "content": error_text})
         with st.chat_message("assistant"):
             st.markdown(error_text)
