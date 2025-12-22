@@ -58,7 +58,7 @@ def _get_openai_client():
 
 # Назначение: превратить найденные куски базы знаний в одну строку, которую мы передаём в GPT.
 # Зачем: GPT сам не “ходит” в Chroma и не видит базу знаний — он отвечает только по тексту, который мы положим в prompt.
-# Связано с: `retriever.retrieve()` (находит куски) и `_answer_with_rag()`/`prompts.build_messages()` (кладут контекст в запрос к GPT).
+# Связано с: `retriever.retrieve()` (находит куски) и `_answer_with_rag()` (кладёт контекст в messages для GPT).
 def _build_context_text(hits):
     parts = []
     for hit in hits:
@@ -70,7 +70,7 @@ def _build_context_text(hits):
 #-------------------------
 # Назначение: собрать историю SQL-запросов в одном тексте для передачи в GPT.
 # Зачем: пользователь может уточнять и продолжать работу, а модель должна видеть, что уже выполнялось.
-# Связано с: `st.session_state.sql_history` (хранилище) и `prompts.build_*_messages()` (куда этот текст подставляется).
+# Связано с: `st.session_state.sql_history` (хранилище) и `_answer_with_rag()`/`_generate_sql()`/`_fix_sql()` (куда этот текст подставляется).
 def _get_sql_history_text():
     sql_history = st.session_state.get("sql_history", [])
     if not sql_history:
@@ -85,7 +85,7 @@ def _get_sql_history_text():
 
 # Назначение: взять историю чата из `st.session_state` и подготовить её для передачи в GPT.
 # Зачем: по умолчанию GPT “не помнит” прошлые сообщения — он видит только то, что мы кладём в `messages`.
-# Связано с: `st.session_state.messages` (хранилище UI-истории) и `prompts.build_messages()` (сборка messages для GPT).
+# Связано с: `st.session_state.messages` (хранилище UI-истории) и `_answer_with_rag()`/`_generate_sql()`/`_fix_sql()` (messages для GPT).
 def _get_chat_history_for_gpt():
     history = []
     for message in st.session_state.get("messages", []):
@@ -114,7 +114,7 @@ def _get_clickhouse_client():
 #-------------------------
 # Назначение: сформировать текст схемы ClickHouse для промпта.
 # Зачем: в режиме SQL мы всегда передаём схему, чтобы GPT не выдумывал таблицы/колонки.
-# Связано с: `ClickHouse_client.get_schema()` (источник правды) и `prompts.build_sql_messages()` (куда схема вставляется).
+# Связано с: `ClickHouse_client.get_schema()` (источник правды) и `_generate_sql()`/`_fix_sql()` (куда схема вставляется).
 def _get_schema_text():
     clickhouse_client = _get_clickhouse_client()
     schema = clickhouse_client.get_schema(CLICKHOUSE_DB)
@@ -124,6 +124,27 @@ def _get_schema_text():
         cols_text = ", ".join([f"`{col_name}` {col_type}" for col_name, col_type in cols])
         lines.append(f"- `{CLICKHOUSE_DB}.{table_name}`: {cols_text}")
     return "\n".join(lines).strip()
+
+
+#-------------------------
+# Назначение: автоматически выбрать режим (RAG или SQL), как в `ai_bi`, но максимально просто.
+# Зачем: пользователь не должен вручную переключать режим — мы сами решаем, это вопрос к базе знаний/диалогу или запрос к данным.
+# Связано с: `prompts.ROUTER_PROMPT` (правила выбора) и основным обработчиком внизу файла (ветка RAG/SQL).
+def _select_mode():
+    client = _get_openai_client()
+    history = _get_chat_history_for_gpt()
+    sql_history_text = _get_sql_history_text()
+
+    messages = [{"role": "system", "content": prompts.ROUTER_PROMPT}]
+    if sql_history_text:
+        messages.append({"role": "system", "content": sql_history_text})
+    messages.extend(history)
+
+    response = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0)
+    mode_text = (response.choices[0].message.content or "").strip().lower()
+    if "```mode" in mode_text and "sql" in mode_text:
+        return "SQL"
+    return "RAG"
 
 
 #-------------------------
@@ -152,15 +173,15 @@ def _extract_sql_text(model_text):
 #-------------------------
 # Назначение: сгенерировать SQL по вопросу пользователя (режим SQL).
 # Зачем: пользователь пишет обычный вопрос, а мы получаем SQL для выполнения в ClickHouse.
-# Связано с: `prompts.build_sql_messages()` (формирует messages) и `_run_sql_with_autofix()` (выполнение и автопочинка).
+# Связано с: `prompts.SQL_SYSTEM_PROMPT` (правила для SQL) и `_run_sql_with_autofix()` (выполнение и автопочинка).
 def _generate_sql(question, schema_text, history, sql_history_text):
     client = _get_openai_client()
-    messages = prompts.build_sql_messages(
-        question=question,
-        schema_text=schema_text,
-        history=history,
-        sql_history_text=sql_history_text,
-    )
+    messages = [{"role": "system", "content": prompts.SQL_SYSTEM_PROMPT}]
+    if sql_history_text:
+        messages.append({"role": "system", "content": sql_history_text})
+    messages.append({"role": "system", "content": schema_text})
+    messages.extend(history)
+    messages.append({"role": "user", "content": question.strip()})
     response = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0)
     return _extract_sql_text(response.choices[0].message.content)
 
@@ -168,16 +189,25 @@ def _generate_sql(question, schema_text, history, sql_history_text):
 #-------------------------
 # Назначение: попросить GPT починить SQL после ошибки ClickHouse (одна попытка).
 # Зачем: автопочинка снимает типичные проблемы (опечатки колонок, таблиц, алиасы) без ручной правки.
-# Связано с: `prompts.build_sql_fix_messages()` и `_run_sql_with_autofix()` (повторный запуск исправленного SQL).
+# Связано с: `prompts.SQL_SYSTEM_PROMPT` (правила для SQL) и `_run_sql_with_autofix()` (повторный запуск исправленного SQL).
 def _fix_sql(question, schema_text, history, sql_history_text, sql_text, error_text):
     client = _get_openai_client()
-    messages = prompts.build_sql_fix_messages(
-        question=question,
-        schema_text=schema_text,
-        history=history,
-        sql_history_text=sql_history_text,
-        sql_text=sql_text,
-        error_text=error_text,
+    messages = [{"role": "system", "content": prompts.SQL_SYSTEM_PROMPT}]
+    if sql_history_text:
+        messages.append({"role": "system", "content": sql_history_text})
+    messages.append({"role": "system", "content": schema_text})
+    messages.extend(history)
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Почини SQL после ошибки ClickHouse.\n\n"
+                f"Вопрос пользователя:\n{question.strip()}\n\n"
+                f"Ошибка ClickHouse:\n{error_text.strip()}\n\n"
+                f"Исходный SQL:\n{sql_text.strip()}\n\n"
+                "Верни исправленный SQL."
+            ).strip(),
+        }
     )
     response = client.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0)
     return _extract_sql_text(response.choices[0].message.content)
@@ -189,6 +219,8 @@ def _fix_sql(question, schema_text, history, sql_history_text, sql_text, error_t
 # Связано с: `_generate_sql()` (первый SQL), `_fix_sql()` (починка) и `ClickHouse_client.query_run()` (выполнение).
 def _run_sql_with_autofix(question):
     history = _get_chat_history_for_gpt()
+    if history and history[-1].get("role") == "user" and (history[-1].get("content") or "").strip() == question.strip():
+        history = history[:-1]
     sql_history_text = _get_sql_history_text()
     schema_text = _get_schema_text()
 
@@ -218,7 +250,7 @@ def _run_sql_with_autofix(question):
 # Назначение: выполнить самый простой RAG-пайплайн: найти контекст и ответить строго по нему.
 # Зачем: GPT отвечает только по тексту, который мы ему передали. Поэтому сначала делаем retrieval (поиск чанков в коллекции Chroma),
 # потом кладём найденный текст в prompt и только после этого спрашиваем GPT.
-# Связано с: `retriever.retrieve()` (ищет top-k чанков в общей коллекции базы знаний) и `prompts.build_messages()` (собирает prompt).
+# Связано с: `retriever.retrieve()` (ищет top-k чанков в базе знаний) и `prompts.RAG_SYSTEM_PROMPT` (правила ответа).
 def _answer_with_rag(question):
     hits = retriever.retrieve(
         query=question,
@@ -230,7 +262,11 @@ def _answer_with_rag(question):
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
     sql_history_text = _get_sql_history_text()
-    messages = prompts.build_rag_messages(context=context_text, history=history, sql_history_text=sql_history_text)
+    messages = [{"role": "system", "content": prompts.RAG_SYSTEM_PROMPT}]
+    if sql_history_text:
+        messages.append({"role": "system", "content": sql_history_text})
+    messages.append({"role": "system", "content": f"КОНТЕКСТ БАЗЫ ЗНАНИЙ:\n{context_text}".strip()})
+    messages.extend(history)
     resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages)
     return (resp.choices[0].message.content or "").strip()
 
@@ -241,28 +277,13 @@ def _answer_with_rag(question):
 # Назначение: этот блок — "экран" приложения. Он показывает историю чата, принимает новый вопрос
 # и запускает RAG-ответ через `_answer_with_rag()`.
 # Связано с: `_answer_with_rag()` (получает ответ), `_build_context_text()` (собирает контекст),
-# `retriever.retrieve()` (ищет в базе знаний) и `prompts.build_messages()` (формирует prompt для GPT).
+# `retriever.retrieve()` (ищет в базе знаний) и `prompts.RAG_SYSTEM_PROMPT`/`prompts.SQL_SYSTEM_PROMPT` (правила режима).
 
 # Настройка страницы (заголовок вкладки браузера).
 st.set_page_config(page_title=APP_TITLE)
 
 # Заголовок приложения на странице.
 st.title(APP_TITLE)
-
-#-------------------------
-# Назначение: минимальный селектор режима (только RAG и SQL).
-# Зачем: пользователь явно выбирает, нужно ли ему общение по базе знаний/диалогу или выполнение SQL.
-# Связано с: `_answer_with_rag()` (RAG) и `_run_sql_with_autofix()` (SQL).
-with st.sidebar:
-    mode = st.radio("Режим", ["RAG", "SQL"])
-    with st.expander("История SQL", expanded=False):
-        sql_history = st.session_state.get("sql_history", [])
-        if not sql_history:
-            st.caption("Пока пусто.")
-        for index, sql_text in enumerate(sql_history, start=1):
-            sql_clean = (sql_text or "").strip()
-            if sql_clean:
-                st.code(sql_clean, language="sql")
 
 # Инициализация истории чата в `st.session_state`.
 # Зачем: Streamlit перезапускает скрипт на каждое действие пользователя, а `session_state`
@@ -278,7 +299,7 @@ if "messages" not in st.session_state:
 #-------------------------
 # Назначение: отдельная область истории для SQL-запросов (только текст SQL).
 # Зачем: SQL нужен и для UI (показать пользователю), и для контекста (чтобы GPT видел, что уже выполнялось).
-# Связано с: `_get_sql_history_text()` и сайдбаром "История SQL".
+# Связано с: `_get_sql_history_text()` (передаём в GPT как память) и веткой SQL (куда записываем выполненный запрос).
 if "sql_history" not in st.session_state:
     st.session_state.sql_history = []
 
@@ -309,7 +330,8 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
-    # 3) Получаем ответ в зависимости от выбранного режима.
+    # 3) Автоматически выбираем режим и получаем ответ.
+    mode = _select_mode()
     if mode == "RAG":
         answer = _answer_with_rag(question)
         st.session_state.messages.append({"role": "assistant", "content": answer})
