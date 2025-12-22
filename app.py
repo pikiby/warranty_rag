@@ -49,6 +49,22 @@ def _normalize_user_text(text):
     return normalized
 
 
+#-------------------------
+# Назначение: достать имена таблиц из текста базы знаний.
+# Зачем: `ClickHouse_client.get_schema()` в текущем варианте работает только по явному списку таблиц (через DESCRIBE TABLE),
+# поэтому нам нужно сначала понять, какие таблицы относятся к вопросу, из KB-контекста.
+# Связано с: `_run_sql_with_autofix()` — делает retrieval в базу знаний, извлекает таблицы и подтягивает схему.
+def _extract_table_names_from_kb(context_text):
+    import re
+
+    text = (context_text or "").strip()
+    if not text:
+        return []
+
+    names = re.findall(r"\b(?:t|d)_[a-zA-Z0-9_]{2,}\b", text)
+    return sorted(set(names))
+
+
 # Назначение: переиндексировать базу знаний при старте процесса Streamlit (то есть при перезапуске сервиса).
 # Зачем: чтобы на деплое индекс создавался автоматически, без ручного запуска `python ingest.py`.
 # Связано с: `ingest.run_ingest()` (строит индекс) и `retriever.retrieve()` (потом читает индекс).
@@ -133,17 +149,15 @@ def _get_clickhouse_client():
 
 
 #-------------------------
-# Назначение: сформировать текст схемы ClickHouse для промпта.
-# Зачем: в режиме SQL мы всегда передаём схему, чтобы GPT не выдумывал таблицы/колонки.
+# Назначение: получить схему ClickHouse (в виде текста) для промпта для одной таблицы.
+# Зачем: в режиме SQL мы передаём схему, чтобы GPT не выдумывал таблицы/колонки.
 # Связано с: `ClickHouse_client.get_schema()` (источник правды) и `_generate_sql()`/`_fix_sql()` (куда схема вставляется).
-def _get_schema_text():
+def _get_schema_text(table_name):
     clickhouse_client = _get_clickhouse_client()
-    schema = clickhouse_client.get_schema(CLICKHOUSE_DB)
+    cols = clickhouse_client.get_schema(CLICKHOUSE_DB, table_name)
     lines = [f"СХЕМА CLICKHOUSE (database = `{CLICKHOUSE_DB}`):"]
-    for table_name in sorted(schema.keys()):
-        cols = schema.get(table_name) or []
-        cols_text = ", ".join([f"`{col_name}` {col_type}" for col_name, col_type in cols])
-        lines.append(f"- `{CLICKHOUSE_DB}.{table_name}`: {cols_text}")
+    cols_text = ", ".join([f"`{col_name}` {col_type}" for col_name, col_type in (cols or [])])
+    lines.append(f"- `{CLICKHOUSE_DB}.{table_name}`: {cols_text}")
     return "\n".join(lines).strip()
 
 
@@ -304,10 +318,21 @@ def _run_sql_with_autofix(question):
     history = _get_chat_history_for_gpt()
     if history and history[-1].get("role") == "user":
         history = history[:-1]
-    sql_history_text = _get_sql_history_text()
-    schema_text = _get_schema_text()
-
     question = _normalize_user_text(question)
+    sql_history_text = _get_sql_history_text()
+
+    #-------------------------
+    # Шаг: берём таблицы из базы знаний и тянем схему только по ним.
+    # Важно: `get_schema()` в текущем варианте требует список таблиц, поэтому без KB-контекста схему не построить.
+    kb_hits = retriever.retrieve(query=question, k=5, chroma_path=CHROMA_PATH, collection_name=COLLECTION_NAME)
+    kb_context_text = _build_context_text(kb_hits)
+    table_names = _extract_table_names_from_kb(kb_context_text)
+    if not table_names:
+        raise RuntimeError("Не могу определить таблицу из базы знаний. Уточните, к какой таблице нужен запрос.")
+
+    table_name = table_names[0]
+    schema_text = _get_schema_text(table_name)
+
     sql_text = _generate_sql(question, schema_text, history, sql_history_text)
     if not sql_text:
         raise RuntimeError("GPT не вернул SQL.")

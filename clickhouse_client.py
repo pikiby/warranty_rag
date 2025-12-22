@@ -1,6 +1,6 @@
 # clickhouse_client.py
 #
-# Назначение: минимальный клиент ClickHouse для выполнения SQL и загрузки схемы (system.columns).
+# Назначение: минимальный клиент ClickHouse для выполнения SQL и загрузки схемы таблиц.
 # Связано с: `app.py` (режим SQL) — генерирует SQL через GPT, выполняет запрос через `query_run()`,
 #           и всегда подгружает схему через `get_schema()` для подсказки модели и автопочинки.
 
@@ -75,23 +75,20 @@ class ClickHouse_client:
         return pd.DataFrame(result.result_rows, columns=result.column_names)
 
     #-------------------------
-    # Назначение: загрузить схему таблиц из system.columns.
+    # Назначение: загрузить схему таблиц.
     # Зачем: схема всегда передаётся в GPT в режиме SQL, чтобы он не выдумывал колонки/таблицы.
     # Связано с: `app.py::_get_schema_text()` — формирует текстовую подсказку для промпта.
-    def get_schema(self, database, tables=None):
-        tb_filter = ""
-        if tables:
-            quoted = ",".join([f"'{table_name}'" for table_name in tables])
-            tb_filter = f" AND table IN ({quoted})"
-        sql = f"""
-        SELECT table, name, type
-        FROM system.columns
-        WHERE database = '{database}' {tb_filter}
-        ORDER BY table, position
-        """
+    def get_schema(self, database, table_name):
+        #-------------------------
+        # Назначение: получить схему таблиц без обращения к `system.*`.
+        # Зачем: запросы к `system.columns` запрещены правилами проекта; вместо этого используем `DESCRIBE TABLE`.
+        # Связано с: `app.py::_get_schema_text()` — берёт схему и формирует текст для GPT.
+        #
+        # Важно: мы берём схему только одной таблицы за раз. Полная схема всей БД слишком большая для GPT.
+        table_name = (table_name or "").strip()
+        if not table_name:
+            return []
+
+        sql = f"DESCRIBE TABLE `{database}`.`{table_name}`"
         res = self.client.query(sql)
-        rows = list(res.result_rows)
-        schema = {}
-        for table_name, column_name, column_type in rows:
-            schema.setdefault(table_name, []).append((column_name, column_type))
-        return schema
+        return [(row[0], row[1]) for row in (res.result_rows or [])]
