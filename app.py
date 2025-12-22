@@ -150,15 +150,10 @@ def _build_context_text(hits):
 # Зачем: пользователь может уточнять и продолжать работу, а модель должна видеть, что уже выполнялось.
 # Связано с: `st.session_state.sql_history` (хранилище) и `_answer_with_rag()`/`_generate_sql()`/`_fix_sql()` (куда этот текст подставляется).
 def _get_sql_history_text():
-    sql_history = st.session_state.get("sql_history", [])
-    if not sql_history:
+    last_sql = (st.session_state.get("last_sql") or "").strip()
+    if not last_sql:
         return ""
-    parts = ["ИСТОРИЯ SQL ЗАПРОСОВ (от старых к новым):"]
-    for index, sql_text in enumerate(sql_history, start=1):
-        sql_clean = (sql_text or "").strip()
-        if sql_clean:
-            parts.append(f"[{index}]\n{sql_clean}")
-    return "\n\n---\n\n".join(parts).strip()
+    return ("ПОСЛЕДНИЙ ВЫПОЛНЕННЫЙ SQL (как память для продолжения):\n" + last_sql).strip()
 
 
 # Назначение: взять историю чата из `st.session_state` и подготовить её для передачи в GPT.
@@ -367,7 +362,7 @@ def _run_sql_with_autofix(question):
     #-------------------------
     # Шаг: берём таблицы из базы знаний и тянем схему только по ним.
     # Важно: `get_schema()` в текущем варианте требует список таблиц, поэтому без KB-контекста схему не построить.
-    kb_hits = retriever.retrieve(query=question, k=5, chroma_path=CHROMA_PATH, collection_name=COLLECTION_NAME)
+    kb_hits = retriever.retrieve(query=question, k=10, chroma_path=CHROMA_PATH, collection_name=COLLECTION_NAME)
     kb_context_text = _build_context_text(kb_hits)
     table_names = _extract_table_names_from_kb(kb_context_text)
     if not table_names:
@@ -504,6 +499,7 @@ def _handle_sql_message(question):
         return
 
     st.session_state.sql_history.append(used_sql)
+    st.session_state.last_sql = used_sql
     answer_text = "Готово. Выполнил SQL и показал результат."
     st.session_state.messages.append({"role": "assistant", "content": answer_text, "sql_query": used_sql, "df": df})
     with st.chat_message("assistant"):
@@ -524,7 +520,7 @@ def _answer_with_rag(question):
 
     hits = retriever.retrieve(
         query=question,
-        k=5,
+        k=10,
         chroma_path=CHROMA_PATH,
         collection_name=COLLECTION_NAME,
     )
@@ -569,6 +565,14 @@ if "messages" not in st.session_state:
 # Связано с: `_get_sql_history_text()` (передаём в GPT как память) и веткой SQL (куда записываем выполненный запрос).
 if "sql_history" not in st.session_state:
     st.session_state.sql_history = []
+
+#-------------------------
+# Назначение: хранить только последний выполненный SQL отдельно (короткая память для продолжения).
+# Зачем: полная история SQL быстро раздувает контекст и может ломать ответы/лимиты токенов; для продолжения диалога
+# обычно достаточно одного последнего запроса.
+# Связано с: `_get_sql_history_text()` (передаём последний SQL в GPT при генерации/починке SQL).
+if "last_sql" not in st.session_state:
+    st.session_state.last_sql = ""
 
 # Отрисовка всей истории сообщений (user/assistant) на экране.
 for message in st.session_state.messages:
