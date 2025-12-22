@@ -388,15 +388,6 @@ def _answer_with_rag(question):
         chroma_path=CHROMA_PATH,
         collection_name=COLLECTION_NAME,
     )
-    if not hits:
-        rewritten_query = _rewrite_query_for_kb(question)
-        if rewritten_query:
-            hits = retriever.retrieve(
-                query=rewritten_query,
-                k=5,
-                chroma_path=CHROMA_PATH,
-                collection_name=COLLECTION_NAME,
-            )
     context_text = _build_context_text(hits)
     client = _get_openai_client()
     history = _get_chat_history_for_gpt()
