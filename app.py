@@ -66,6 +66,25 @@ def _build_context_text(hits):
     return "\n\n".join(parts).strip()
 
 
+# Назначение: взять историю чата из `st.session_state` и подготовить её для передачи в GPT.
+# Зачем: по умолчанию GPT “не помнит” прошлые сообщения — он видит только то, что мы кладём в `messages`.
+# Связано с: `st.session_state.messages` (хранилище UI-истории) и `prompts.build_messages()` (сборка messages для GPT).
+def _get_chat_history_for_gpt():
+    history = []
+    for message in st.session_state.get("messages", []):
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role not in ("user", "assistant"):
+            continue
+        if not content:
+            continue
+        # Первое приветствие ассистента нужно для UI, но не обязательно для логики диалога у GPT.
+        if role == "assistant" and content.startswith("Задайте вопрос."):
+            continue
+        history.append({"role": role, "content": content})
+    return history
+
+
 # Назначение: выполнить самый простой RAG-пайплайн: найти контекст и ответить строго по нему.
 # Зачем: GPT отвечает только по тексту, который мы ему передали. Поэтому сначала делаем retrieval (поиск чанков в коллекции Chroma),
 # потом кладём найденный текст в prompt и только после этого спрашиваем GPT.
@@ -82,7 +101,10 @@ def _answer_with_rag(question):
         return "В индексе базы знаний нет данных по запросу (или индекс не создан)."
 
     client = _get_openai_client()
-    messages = prompts.build_messages(question=question, context=context_text)
+    history = _get_chat_history_for_gpt()
+    # В историю уже попал текущий вопрос (мы добавляем его в UI-историю до вызова `_answer_with_rag()`).
+    # Поэтому здесь достаточно передать history целиком, без отдельного question.
+    messages = prompts.build_messages(context=context_text, history=history)
     resp = client.chat.completions.create(model=OPENAI_MODEL, messages=messages)
     return (resp.choices[0].message.content or "").strip()
 

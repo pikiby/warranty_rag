@@ -19,14 +19,16 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-# Назначение: собрать минимальный промпт для строгого RAG-ответа.
-# Связано с: `app.py::_answer_with_rag()`, которая передаёт сообщения в OpenAI chat-completions.
-def build_messages(*, question, context):
-    return [
+# Назначение: собрать сообщения для GPT (system + RAG-контекст + история диалога).
+# Зачем: чтобы GPT видел предыдущие реплики и отвечал с учётом диалога, но при этом строго по найденному контексту.
+# Связано с: `app.py::_answer_with_rag()`, которая передаёт результат в `client.chat.completions.create(...)`.
+def build_messages(*, context, history):
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": f"КОНТЕКСТ:\n{context}".strip()},
-        {"role": "user", "content": question.strip()},
     ]
+    messages.extend(history)
+    return messages
 
 
 
