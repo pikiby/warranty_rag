@@ -26,7 +26,7 @@ APP_TITLE = "Minimal RAG Chat"
 KB_DOCS_DIR = os.getenv("KB_DOCS_DIR", "docs")
 CHROMA_PATH = os.getenv("KB_CHROMA_PATH", "data/chroma")
 COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "kb_docs")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1-mini")
 CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB", "db1")
 
 #-------------------------
@@ -384,7 +384,7 @@ def _answer_with_rag(question):
 
     hits = retriever.retrieve(
         query=question,
-        k=5,
+        k=8,
         chroma_path=CHROMA_PATH,
         collection_name=COLLECTION_NAME,
     )
