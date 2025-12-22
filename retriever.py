@@ -43,7 +43,7 @@ def _get_collection(*, chroma_path, collection_name):
 def retrieve(
     *,
     query,
-    k=8,
+    k=5,
     chroma_path="data/chroma",
     collection_name="kb_docs",
 ):
@@ -93,6 +93,5 @@ def retrieve(
                 }
             )
     return hits
-
 
 

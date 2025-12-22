@@ -384,7 +384,7 @@ def _answer_with_rag(question):
 
     hits = retriever.retrieve(
         query=question,
-        k=8,
+        k=5,
         chroma_path=CHROMA_PATH,
         collection_name=COLLECTION_NAME,
     )
